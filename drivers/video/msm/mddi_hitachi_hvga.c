@@ -18,6 +18,7 @@
  * You should have received a copy of the GNU General Public License
  * along with this program; if not, you can find it at http://www.fsf.org
  */
+#undef UPDATE_LUT_FROM_SDCARD // mdp_hw_init.c 와 동기를 맞출것.
 
 #include "msm_fb.h"
 #include "mddihost.h"
@@ -26,6 +27,12 @@
 #include <mach/vreg.h>
 #include <mach/board_lge.h>
 
+#ifdef UPDATE_LUT_FROM_SDCARD
+#include <linux/syscalls.h>
+#include <linux/fcntl.h>
+#include "mdp.h"
+#endif
+
 #define PANEL_DEBUG 0
 
 #define LCD_CONTROL_BLOCK_BASE	0x110000
@@ -33,11 +40,9 @@
 #define INTMSK		LCD_CONTROL_BLOCK_BASE|(0x1c)
 #define VPOS		LCD_CONTROL_BLOCK_BASE|(0xc0)
 
-#if 0
 static uint32 mddi_hitachi_curr_vpos;
 static boolean mddi_hitachi_monitor_refresh_value = FALSE;
 static boolean mddi_hitachi_report_refresh_measurements = FALSE;
-#endif
 static boolean is_lcd_on = -1;
 
 /* The comment from AMSS codes:
@@ -47,13 +52,18 @@ static boolean is_lcd_on = -1;
  * XXX: TODO: change this values for INNOTEK PANEL */
 static uint32 mddi_hitachi_rows_per_second = 31250;
 static uint32 mddi_hitachi_rows_per_refresh = 480;
+static uint32 mddi_hitachi_usecs_per_refresh = 15360; /* rows_per_refresh / rows_per_second */
 extern boolean mddi_vsync_detect_enabled;
 
 static msm_fb_vsync_handler_type mddi_hitachi_vsync_handler = NULL;
 static void *mddi_hitachi_vsync_handler_arg;
 static uint16 mddi_hitachi_vsync_attempts;
 
-#if defined(CONFIG_MACH_MSM7X27_THUNDERG) || defined(CONFIG_MACH_MSM7X27_THUNDERC) || defined(CONFIG_MACH_MSM7X27_THUNDERA)
+#if defined(CONFIG_FB_MSM_MDDI_NOVATEK_HITACHI_HVGA)
+extern int g_mddi_lcd_probe;
+#endif
+
+#if defined(CONFIG_MACH_MSM7X27_GELATO)
 /* Define new structure named 'msm_panel_hitachi_pdata' to use LCD initialization Flag (initialized)
  * 2010-04-21, minjong.gong@lge.com
  */
@@ -92,29 +102,17 @@ struct display_table2 {
 #define REGFLAG_DELAY             0XFFFE
 #define REGFLAG_END_OF_TABLE      0xFFFF   // END OF REGISTERS MARKER
 
-static struct display_table mddi_hitachi_2c[] = {
-	{0x2c, 4, {0x00, 0x00, 0x00, 0x00}},
-	{REGFLAG_END_OF_TABLE, 0x00, {}}
-};
-
 static struct display_table mddi_hitachi_position_table[] = {
 	// set column address 
-	{0x2a,  4, {0x00, 0x00, 0x01, 0x3f}},
+	{0x2a, 4, {0x00, 0x00, 0x01, 0x3f}},
 	// set page address 
-	{0x2b,  4, {0x00, 0x00, 0x01, 0xdf}},
+	{0x2b, 4, {0x00, 0x00, 0x01, 0xdf}},
+	// do it after 0x2a, 0x2b
+	{0x3c, 4, {0x00, 0x00, 0x01, 0x00}},
 	{REGFLAG_END_OF_TABLE, 0x00, {}}
 };
 
-static struct display_table mddi_hitachi_display_on_1st[] = {
-	// Display on sequence
-	{0x11, 4, {0x00, 0x00, 0x00, 0x00}},
-	{REGFLAG_DELAY, 80, {}},
-	{0x2c, 4, {0x00, 0x00, 0x00, 0x00}},
-	{0x29, 4, {0x00, 0x00, 0x00, 0x00}},
-	{0x2c, 4, {0x00, 0x00, 0x00, 0x00}},
-	{REGFLAG_END_OF_TABLE, 0x00, {}}
-};
-static struct display_table mddi_hitachi_display_on_3rd[] = {
+static struct display_table mddi_hitachi_display_on[] = {
 	// Display on sequence
 	{0x11, 4, {0x00, 0x00, 0x00, 0x00}},
 	{REGFLAG_DELAY, 80, {}},
@@ -122,26 +120,14 @@ static struct display_table mddi_hitachi_display_on_3rd[] = {
 	{REGFLAG_END_OF_TABLE, 0x00, {}}
 };
 
-#if 0
-static struct display_table2 mddi_hitachi_img[] = {
-	{0x2c, 16384, {}},
-};
-static struct display_table mddi_hitachi_img_end[] = {
-	{0x00, 0, {}},
-	{REGFLAG_END_OF_TABLE, 0x00, {}}
-};
-#endif
-
-#if 0
 static struct display_table mddi_hitachi_display_off[] = {
 	// Display off sequence
 	{0x28, 4, {0x00, 0x00, 0x00, 0x00}},
 	{REGFLAG_DELAY, 40, {}},
 	{0x10, 4, {0x00, 0x00, 0x00, 0x00}},
-	{REGFLAG_DELAY, 130, {}},
+	{REGFLAG_DELAY, 40, {}},
 	{REGFLAG_END_OF_TABLE, 0x00, {}}
 };
-#endif
 
 static struct display_table mddi_hitachi_sleep_mode_on_data[] = {
 	// Display off sequence
@@ -154,74 +140,7 @@ static struct display_table mddi_hitachi_sleep_mode_on_data[] = {
 	{REGFLAG_END_OF_TABLE, 0x00, {}}
 };
 
-static struct display_table mddi_hitachi_initialize_1st[] = {
-
-	// Power ON Sequence 
-	{0xf0, 4, {0x5a, 0x5a, 0x00, 0x00}},
-	{0xf1, 4, {0x5a, 0x5a, 0x00, 0x00}},
-	{0xd0, 4, {0x06, 0x00, 0x00, 0x00}},
-
-	// PWRCTL 
-	{0xf4, 16, {0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-			    0x04, 0x66, 0x02, 0x04, 0x66, 0x02, 0x00, 0x00}},
-
-	// VCMCTL 
-	{0xf5, 12, {0x00, 0x59, 0x45, 0x00, 0x00, 0x00, 0x00, 0x00,
-			    0x01, 0x01, 0x59, 0x45}},
-	{REGFLAG_DELAY, 10, {}},
-
-	// MANPWRSEQ 
-	{0xf3, 8,  {0x01, 0x6e, 0x15, 0x07, 0x03, 0x00, 0x00, 0x00}},
-	// change 3rd parameter from 0x1d to 0x15 to reduce flicker.
-	
-	// DISCTL 
-	{0xf2, 20, {0x3b, 0x54, 0x0f, 0x18, 0x18, 0x00, 0x00, 0x00,
-			    0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x3f, 0x18,
-			    0x18, 0x18, 0x18, 0x00}},
-	// 0x3b - 480 line
-	// 0x3b - 60hz
-
-	{0xf6, 12, {0x04, 0x00, 0x08, 0x03, 0x01, 0x00, 0x01, 0x00,
-			    0x00, 0x00, 0x00, 0x00}},
-
-	{0xf9, 4,  {0x27, 0x00, 0x00, 0x00}},
-
-	// PGAMMACTL 
-	//{0xfa, 16, {0x11, 0x13, 0x08, 0x14, 0x28, 0x2c, 0x2b, 0x0d,
-	//		    0x19, 0x14, 0x1e, 0x1e, 0x0f, 0x00, 0x00, 0x00}},
-	// Apply 3rd Cut gamma table. 2010-08-10. minjong.gong@lge.com
-	{0xfa, 16, {0x03, 0x03, 0x08, 0x28, 0x2b, 0x2f, 0x32, 0x12,
-				0x1d, 0x1f, 0x1c, 0x1c, 0x0f, 0x00, 0x00, 0x00}},
-
-	// NGAMMACTL 
-	//{0xfb, 16, {0x11, 0x13, 0x08, 0x14, 0x28, 0x2c, 0x2b, 0x2d,
-	//			0x19, 0x14, 0x1e, 0x1e, 0x0f, 0x00, 0x00, 0x00}},
-	// Apply 3rd Cut gamma table. 2010-08-10. minjong.gong@lge.com
-	{0xfb, 16, {0x03, 0x03, 0x08, 0x28, 0x2b, 0x2f, 0x32, 0x12,
-				0x1d, 0x1f, 0x1c, 0x1c, 0x0f, 0x00, 0x00, 0x00}},
-
-	// MADCTL 
-	{0x36,  4, {0x48, 0x00, 0x00, 0x00}},
-
-	// TEON 
-	{0x35,  4, {0x00, 0x00, 0x00, 0x00}},
-
-	// COLMOD 
-	{0x3a,  4, {0x55, 0x00, 0x00, 0x00}},
-
-	// set column address 
-	{0x2a,  4, {0x00, 0x00, 0x01, 0x3f}},
-
-	// set page address 
-	{0x2b,  4, {0x00, 0x00, 0x01, 0xdf}},
-
-	{0x2c,  4, {0x00, 0x00, 0x00, 0x00}},
-	{REGFLAG_END_OF_TABLE, 0x00, {}}
-};
-
-#ifdef CONFIG_MACH_MSM7X27_THUNDERC
-static struct display_table mddi_hitachi_initialize_3rd_vs660[] = {
-
+static struct display_table mddi_hitachi_initialize[] = {
 	// Power ON Sequence 
 	{0xf0, 4, {0x5a, 0x5a, 0x00, 0x00}},
 	{0xf1, 4, {0x5a, 0x5a, 0x00, 0x00}},
@@ -232,54 +151,56 @@ static struct display_table mddi_hitachi_initialize_3rd_vs660[] = {
 			    0x3f, 0x66, 0x02, 0x3f, 0x66, 0x02, 0x00, 0x00}},
 
 	// VCMCTL 
-	// Revert 6th parameter. From 0x04 to 0x00. 2010-09-02. minjong.gong@lge.com
+	// [Apply 4th Table] Change 6th parameter. From 0x00 to 0x04. 2010-08-03. minjong.gong@lge.com
+//	{0xf5, 12, {0x00, 0x59, 0x45, 0x00, 0x00, 0x04, 0x00, 0x00,
+//			    0x00, 0x00, 0x59, 0x45}},
+
+	// Change 6th parameter. From 0x04 to 0x00. 2011-03-11. hoseok.kim@lge.com
 	{0xf5, 12, {0x00, 0x59, 0x45, 0x00, 0x00, 0x00, 0x00, 0x00,
 			    0x00, 0x00, 0x59, 0x45}},
+
 	{REGFLAG_DELAY, 10, {}},
 
 	// MANPWRSEQ 
-	// Revert 1st parameter. From 0x03 to 0x01. 2010-09-02. minjong.gong@lge.com
-	{0xf3, 8,  {0x01, 0x6e, 0x15, 0x07, 0x03, 0x00, 0x00, 0x00}},
+	// [Apply 4th Table] Change 1st parameter. From 0x01 to 0x03. 2010-08-03. minjong.gong@lge.com
+	{0xf3, 8, {0x03, 0x6e, 0x15, 0x07, 0x03, 0x00, 0x00, 0x00}},
 	
 	// DISCTL 
-	// Revert 2nd and 15th parameters. From 0x54 to 0x4d.
-	// Revert 6th, 7th, 9th and 10th parameters. From 0x08 to ox00.
-	// 2010-09-02. minjong.gong@lge.com
-	{0xf2, 20, {0x3b, 0x4d, 0x0f, 0x08, 0x08, 0x00, 0x00, 0x00,
-			    0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x4d, 0x08,
+	// Change 2nd and 15th parameters. From 0x4d to 0x54.
+	// When useing 0x4D (65Hz), it causes decreasing the touch sensitivity.
+	// 2010-08-21. minjong.gong@lge.com
+	{0xf2, 20, {0x3b, 0x54, 0x0f, 0x08, 0x08, 0x08, 0x08, 0x00,
+			    0x08, 0x08, 0x00, 0x04, 0x00, 0x00, 0x54, 0x08,
 			    0x08, 0x08, 0x08, 0x00}},
 
 	{0xf6, 12, {0x04, 0x00, 0x08, 0x03, 0x01, 0x00, 0x01, 0x00,
 			    0x00, 0x00, 0x00, 0x00}},
 
-	{0xf9, 4,  {0x27, 0x00, 0x00, 0x00}},
+	{0xf9, 4, {0x27, 0x00, 0x00, 0x00}},
 
 	// PGAMMACTL 
 	{0xfa, 16, {0x03, 0x03, 0x08, 0x28, 0x2b, 0x2f, 0x32, 0x12,
 			    0x1d, 0x1f, 0x1c, 0x1c, 0x0f, 0x00, 0x00, 0x00}},
 
 	// MADCTL 
-	{0x36,  4, {0x48, 0x00, 0x00, 0x00}},
+	{0x36, 4, {0x48, 0x00, 0x00, 0x00}},
 
 	// TEON 
-	{0x35,  4, {0x00, 0x00, 0x00, 0x00}},
+	{0x35, 4, {0x00, 0x00, 0x00, 0x00}},
 
 	// COLMOD 
-	{0x3a,  4, {0x55, 0x00, 0x00, 0x00}},
+	{0x3a, 4, {0x55, 0x00, 0x00, 0x00}},
 
 	// set column address 
-	{0x2a,  4, {0x00, 0x00, 0x01, 0x3f}},
+	{0x2a, 4, {0x00, 0x00, 0x01, 0x3f}},
 
 	// set page address 
-	{0x2b,  4, {0x00, 0x00, 0x01, 0xdf}},
+	{0x2b, 4, {0x00, 0x00, 0x01, 0xdf}},
 
 	{REGFLAG_END_OF_TABLE, 0x00, {}}
 };
-#endif
 
-#ifdef CONFIG_MACH_MSM7X27_THUNDERG
-static struct display_table mddi_hitachi_initialize_3rd_p500[] = {
-
+static struct display_table mddi_hitachi_initialize_20110326[] = {
 	// Power ON Sequence 
 	{0xf0, 4, {0x5a, 0x5a, 0x00, 0x00}},
 	{0xf1, 4, {0x5a, 0x5a, 0x00, 0x00}},
@@ -289,52 +210,239 @@ static struct display_table mddi_hitachi_initialize_3rd_p500[] = {
 			    0x04, 0x66, 0x02, 0x04, 0x66, 0x02, 0x00, 0x00}},
 
 	// VCMCTL 
-	// Revert 6th parameter. From 0x04 to 0x00. 2010-09-02. minjong.gong@lge.com
 	{0xf5, 12, {0x00, 0x59, 0x45, 0x00, 0x00, 0x00, 0x00, 0x00,
 			    0x00, 0x00, 0x59, 0x45}},
 	{REGFLAG_DELAY, 10, {}},
 
 	// MANPWRSEQ 
-	// Revert 1st parameter. From 0x03 to 0x01. 2010-09-02. minjong.gong@lge.com
-	{0xf3, 8,  {0x01, 0x6e, 0x15, 0x07, 0x03, 0x00, 0x00, 0x00}},
+	{0xf3, 8, {0x01, 0x6e, 0x15, 0x07, 0x03, 0x00, 0x00, 0x00}},
 	
-	// DISCTL 
-	// Revert 2nd and 15th parameters. From 0x54 to 0x4d.
-	// Revert 6th, 7th, 9th and 10th parameters. From 0x08 to ox00.
-	// 2010-09-02. minjong.gong@lge.com
-	{0xf2, 20, {0x3b, 0x4d, 0x0f, 0x08, 0x08, 0x00, 0x00, 0x00,
-			    0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x4d, 0x08,
+	// DISCTL : 0x4d(65Hz) -> 0x54(60Hz)
+	{0xf2, 20, {0x3b, 0x54, 0x0f, 0x08, 0x08, 0x00, 0x00, 0x00,
+			    0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x54, 0x08,
 			    0x08, 0x08, 0x08, 0x00}},
 
 	{0xf6, 12, {0x04, 0x00, 0x08, 0x03, 0x01, 0x00, 0x01, 0x00,
 			    0x00, 0x00, 0x00, 0x00}},
 
-	{0xf9, 4,  {0x27, 0x00, 0x00, 0x00}},
+	{0xf9, 4, {0x27, 0x00, 0x00, 0x00}},
 
 	// PGAMMACTL 
 	{0xfa, 16, {0x03, 0x03, 0x08, 0x28, 0x2b, 0x2f, 0x32, 0x12,
 			    0x1d, 0x1f, 0x1c, 0x1c, 0x0f, 0x00, 0x00, 0x00}},
 
 	// MADCTL 
-	{0x36,  4, {0x48, 0x00, 0x00, 0x00}},
+	{0x36, 4, {0x48, 0x00, 0x00, 0x00}},
 
 	// TEON 
-	{0x35,  4, {0x00, 0x00, 0x00, 0x00}},
+	{0x35, 4, {0x00, 0x00, 0x00, 0x00}},
 
-	// COLMOD 
-	{0x3a,  4, {0x55, 0x00, 0x00, 0x00}},
+	// COLMOD : 0x77(24 bit/pixel) -> 0x55(16 bit/pixel)
+	{0x3a, 4, {0x55, 0x00, 0x00, 0x00}},
 
 	// set column address 
-	{0x2a,  4, {0x00, 0x00, 0x01, 0x3f}},
+	{0x2a, 4, {0x00, 0x00, 0x01, 0x3f}},
 
 	// set page address 
-	{0x2b,  4, {0x00, 0x00, 0x01, 0xdf}},
+	{0x2b, 4, {0x00, 0x00, 0x01, 0xdf}},
+
+	// do it after 0x2a, 0x2b
+	{0x3c, 4, {0x00, 0x00, 0x01, 0x00}},
+
+	{REGFLAG_END_OF_TABLE, 0x00, {}}
+};
+
+static struct display_table mddi_hitachi_initialize_20110402[] = {
+	// Power ON Sequence 
+	{0xf0, 4, {0x5a, 0x5a, 0x00, 0x00}},
+	{0xf1, 4, {0x5a, 0x5a, 0x00, 0x00}},
+
+	// PWRCTL : 20110407 Radio Sensitivity p9/p12 : 0x04 -> 0x3f
+	{0xf4, 16, {0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			    0x3f, 0x66, 0x02, 0x3f, 0x66, 0x02, 0x00, 0x00}},
+
+	// VCMCTL 
+	{0xf5, 12, {0x00, 0x59, 0x45, 0x00, 0x00, 0x00, 0x00, 0x00,
+			    0x00, 0x00, 0x59, 0x45}},
+	{REGFLAG_DELAY, 10, {}},
+
+	// MANPWRSEQ : P1 : 0x01 -> 0x03
+	{0xf3, 8, {0x03, 0x6e, 0x15, 0x07, 0x03, 0x00, 0x00, 0x00}},
+
+	// DISCTL : P2 : 0x4d(65Hz) -> 0x54(60Hz),   P6 /P7 / P9 / P10 : 0x00 -> 0x08
+	{0xf2, 20, {0x3b, 0x54, 0x0f, 0x08, 0x08, 0x08, 0x08, 0x00,
+			    0x08, 0x08, 0x00, 0x04, 0x00, 0x00, 0x54, 0x08,
+			    0x08, 0x08, 0x08, 0x00}},
+
+	{0xf6, 12, {0x04, 0x00, 0x08, 0x03, 0x01, 0x00, 0x01, 0x00,
+			    0x00, 0x00, 0x00, 0x00}},
+
+	{0xf9, 4, {0x27, 0x00, 0x00, 0x00}},
+
+	// PGAMMACTL 
+	{0xfa, 16, {0x03, 0x03, 0x08, 0x28, 0x2b, 0x2f, 0x32, 0x12,
+			    0x1d, 0x1f, 0x1c, 0x1c, 0x0f, 0x00, 0x00, 0x00}},
+
+	// MADCTL 
+	{0x36, 4, {0x48, 0x00, 0x00, 0x00}},
+
+	// TEON 
+	{0x35, 4, {0x00, 0x00, 0x00, 0x00}},
+
+	// COLMOD : 0x77(24 bit/pixel) -> 0x55(16 bit/pixel)
+	{0x3a, 4, {0x55, 0x00, 0x00, 0x00}},
+
+	// set column address 
+	{0x2a, 4, {0x00, 0x00, 0x01, 0x3f}},
+
+	// set page address 
+	{0x2b, 4, {0x00, 0x00, 0x01, 0xdf}},
+
+	// do it after 0x2a, 0x2b
+	{0x3c, 4, {0x00, 0x00, 0x00, 0x00}},
+
+	{REGFLAG_END_OF_TABLE, 0x00, {}}
+};
+
+#if defined(CONFIG_FB_MSM_MDDI_24BIT)
+static struct display_table mddi_hitachi_initialize_24bit[] = {
+	// Power ON Sequence 
+	{0xf0, 4, {0x5a, 0x5a, 0x00, 0x00}},
+	{0xf1, 4, {0x5a, 0x5a, 0x00, 0x00}},
+
+	// PWRCTL : 20110407 Radio Sensitivity p9/p12 : 0x04 -> 0x3f
+	{0xf4, 16, {0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			    0x3f, 0x66, 0x02, 0x3f, 0x66, 0x02, 0x00, 0x00}},
+
+	// VCMCTL 
+	{0xf5, 12, {0x00, 0x59, 0x45, 0x00, 0x00, 0x00, 0x00, 0x00,
+			    0x00, 0x00, 0x59, 0x45}},
+	{REGFLAG_DELAY, 10, {}},
+
+	// MANPWRSEQ : P1 : 0x01 -> 0x03
+	{0xf3, 8, {0x03, 0x6e, 0x15, 0x07, 0x03, 0x00, 0x00, 0x00}},
+
+	// DISCTL : P2 : 0x4d(65Hz) -> 0x54(60Hz),   P6 /P7 / P9 / P10 : 0x00 -> 0x08
+	{0xf2, 20, {0x3b, 0x54, 0x0f, 0x08, 0x08, 0x08, 0x08, 0x00,
+			    0x08, 0x08, 0x00, 0x04, 0x00, 0x00, 0x54, 0x08,
+			    0x08, 0x08, 0x08, 0x00}},
+
+	{0xf6, 12, {0x04, 0x00, 0x08, 0x03, 0x01, 0x00, 0x01, 0x00,
+			    0x00, 0x00, 0x00, 0x00}},
+
+	{0xf9, 4, {0x27, 0x00, 0x00, 0x00}},
+
+	// PGAMMACTL 
+	{0xfa, 16, {0x03, 0x03, 0x08, 0x28, 0x2b, 0x2f, 0x32, 0x12,
+			    0x1d, 0x1f, 0x1c, 0x1c, 0x0f, 0x00, 0x00, 0x00}},
+
+	// MADCTL 
+	{0x36, 4, {0x48, 0x00, 0x00, 0x00}},
+
+	// TEON 
+	{0x35, 4, {0x00, 0x00, 0x00, 0x00}},
+
+	// COLMOD : 0x77(24 bit/pixel)
+	{0x3a, 4, {0x77, 0x00, 0x00, 0x00}},
+
+	// set column address 
+	{0x2a, 4, {0x00, 0x00, 0x01, 0x3f}},
+
+	// set page address 
+	{0x2b, 4, {0x00, 0x00, 0x01, 0xdf}},
+
+	// do it after 0x2a, 0x2b
+	{0x3c, 4, {0x00, 0x00, 0x00, 0x00}},
 
 	{REGFLAG_END_OF_TABLE, 0x00, {}}
 };
 #endif
 
-void display_table(struct display_table *table, unsigned int count)
+static struct display_table mddi_hitachi_initialize_3rd_vs660[] = {
+	// Power ON Sequence  
+	{0xf0, 4, {0x5a, 0x5a, 0x00, 0x00}}, 
+	{0xf1, 4, {0x5a, 0x5a, 0x00, 0x00}}, 
+
+	// PWRCTL
+	// [VS660] DCN set value : 0x3F. For reducing LCD noise.
+	{0xf4, 16, {0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+		0x3f, 0x66, 0x02, 0x3f, 0x66, 0x02, 0x00, 0x00}}, 
+
+	// VCMCTL
+	// Revert 6th parameter. From 0x04 to 0x00. 2010-09-02. minjong.gong@lge.com 
+	{0xf5, 12, {0x00, 0x59, 0x45, 0x00, 0x00, 0x00, 0x00, 0x00, 
+		0x00, 0x00, 0x59, 0x45}}, 
+
+	{REGFLAG_DELAY, 10, {}}, 
+
+	// MANPWRSEQ  
+	// Revert 1st parameter. From 0x03 to 0x01. 2010-09-02. minjong.gong@lge.com 
+	{0xf3, 8,  {0x01, 0x6e, 0x15, 0x07, 0x03, 0x00, 0x00, 0x00}}, 
+
+	// DISCTL  
+	// Revert 2nd and 15th parameters. From 0x54 to 0x4d. 
+	// Revert 6th, 7th, 9th and 10th parameters. From 0x08 to ox00. 
+	// 2010-09-02. minjong.gong@lge.com 
+	{0xf2, 20, {0x3b, 0x4d, 0x0f, 0x08, 0x08, 0x00, 0x00, 0x00, 
+		0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x4d, 0x08, 
+		0x08, 0x08, 0x08, 0x00}}, 
+
+	{0xf6, 12, {0x04, 0x00, 0x08, 0x03, 0x01, 0x00, 0x01, 0x00, 
+		0x00, 0x00, 0x00, 0x00}}, 
+
+	{0xf9, 4,  {0x27, 0x00, 0x00, 0x00}},
+
+	// PGAMMACTL  
+	{0xfa, 16, {0x03, 0x03, 0x08, 0x28, 0x2b, 0x2f, 0x32, 0x12, 
+		0x1d, 0x1f, 0x1c, 0x1c, 0x0f, 0x00, 0x00, 0x00}}, 
+
+	// MADCTL 
+	{0x36,  4, {0x48, 0x00, 0x00, 0x00}}, 
+
+	// TEON  
+	{0x35,  4, {0x00, 0x00, 0x00, 0x00}}, 
+
+	// COLMOD  
+	{0x3a,  4, {0x55, 0x00, 0x00, 0x00}}, 
+
+	// set column address  
+	{0x2a,  4, {0x00, 0x00, 0x01, 0x3f}}, 
+
+	// set page address 
+	{0x2b,  4, {0x00, 0x00, 0x01, 0xdf}}, 
+
+	{REGFLAG_END_OF_TABLE, 0x00, {}} 
+};
+
+#ifdef UPDATE_LUT_FROM_SDCARD
+static u32 atoh(const unsigned char *in, unsigned int len)
+{
+	int hex = 0; // 반환될 값. 초기에는 0이다.
+	int nibble; // 16진수의 한 니블(4비트)값을 담아둘 곳
+
+	while (*in) {
+		hex <<= 4;
+
+		if (*in >= '0' && *in <= '9') {
+			nibble = *in - '0';
+		} else if (*in >= 'a' && *in <= 'f') {
+			nibble = *in - 'a' + 10;
+		} else if (*in >= 'A' && *in <= 'F') {
+			nibble = *in - 'A' + 10;
+		} else {
+			nibble = 0;
+		}
+
+		hex |= nibble;
+
+		in++;
+	}
+
+	return hex;
+}
+#endif
+
+void hitachi_display_table(struct display_table *table, unsigned int count)
 {
 	unsigned int i;
 
@@ -354,14 +462,13 @@ void display_table(struct display_table *table, unsigned int count)
                 break;
 				
             default:
-                mddi_host_register_cmds_write8(reg, table[i].count, table[i].val_list, 1, 0, 0);
-				//EPRINTK("%s: reg : %x, val : %x.\n", __func__, reg, table[i].val_list[0]);
+                mddi_host_register_cmds_write8(reg, table[i].count, table[i].val_list, 0, 0, 0);
+//				EPRINTK("%s: reg : %x, val : %x.\n", __func__, reg, table[i].val_list[0]);
        	}
     }
 	
 }
 
-#if 0
 static void compare_table(struct display_table *table, unsigned int count)
 {
 	unsigned int i;
@@ -381,13 +488,11 @@ static void compare_table(struct display_table *table, unsigned int count)
 				
             default:
                 mddi_host_register_cmds_write8(reg, table[i].count, table[i].val_list, 0, 0, 0);
-//				if(table[i].val_list != temp)
-					
-				EPRINTK("%s: reg : %x, val : %x.\n", __func__, reg, table[i].val_list[0]);
+				//EPRINTK("%s: reg : %x, val : %x.\n", __func__, reg, table[i].val_list[0]);
        	}
     }	
 }
-#endif
+
 
 static void mddi_hitachi_vsync_set_handler(msm_fb_vsync_handler_type handler,	/* ISR to be executed */
 					 void *arg)
@@ -424,12 +529,10 @@ static void mddi_hitachi_vsync_set_handler(msm_fb_vsync_handler_type handler,	/*
 	}
 }
 
-/* FIXME: following function has no meaning any more
- * should be eliminated
- * 2010-11-16, cleaneye.kim@lge.com
- */
 static void mddi_hitachi_lcd_vsync_detected(boolean detected)
 {
+	mddi_vsync_detect_enabled = TRUE;;
+
 #if 0
 	/* static timetick_type start_time = 0; */
 	static struct timeval start_time;
@@ -520,61 +623,84 @@ static void mddi_hitachi_lcd_vsync_detected(boolean detected)
 #endif
 }
 
-static void hitachi_workaround(void)
-{
-	if (lge_bd_rev <= LGE_REV_E) {
-		/* Use workaround code for 1st cut LCD.
-		 * 2010-04-22, minjong.gong@lge.com
-		 */
-		display_table(mddi_hitachi_2c,
-					  sizeof(mddi_hitachi_2c) / sizeof(struct display_table));
-	}
-	/* Add code to prevent LCD shift.
-	 * 2010-05-18, minjong.gong@lge.com
-	 */
-	display_table(mddi_hitachi_position_table,
-				  sizeof(mddi_hitachi_position_table) / sizeof(struct display_table));
-}
-
 static int mddi_hitachi_lcd_on(struct platform_device *pdev)
 {
+#ifdef UPDATE_LUT_FROM_SDCARD
+	char lut_str_src[12], lut_str_dst[12];
+	unsigned int lut_value;
+	int fd;
+	int i = 0 ;
+#endif
+
 	EPRINTK("%s: started.\n", __func__);
 
-#if defined(CONFIG_MACH_MSM7X27_THUNDERG) || defined(CONFIG_MACH_MSM7X27_THUNDERC) || defined(CONFIG_MACH_MSM7X27_THUNDERA)
+	/*
+	 * mddi_host_client_cnt_reset:
+	 * reset client_status_cnt to 0 to make sure host does not
+	 * send RTD cmd to client right after resume before mddi
+	 * client be powered up. this fix "MDDI RTD Failure" problem
+	 */
+	mddi_host_client_cnt_reset();
+
+#if defined(CONFIG_MACH_MSM7X27_GELATO)
 	if (system_state == SYSTEM_BOOTING && mddi_hitachi_pdata->initialized) {
-		hitachi_workaround();
 		is_lcd_on = TRUE;
 		return 0;
 	}
 #endif
 	// LCD HW Reset
 	mddi_hitachi_lcd_panel_poweron();
-#if defined(CONFIG_MACH_MSM7X27_THUNDERG)
-	if (lge_bd_rev <= LGE_REV_E) {
-		EPRINTK("ThunderG ==> lge_bd_rev = %d : 1st LCD initial\n", lge_bd_rev);
-		display_table(mddi_hitachi_initialize_1st, sizeof(mddi_hitachi_initialize_1st)/sizeof(struct display_table));
-		display_table(mddi_hitachi_display_on_1st, sizeof(mddi_hitachi_display_on_1st) / sizeof(struct display_table));
-	} else {
-		EPRINTK("ThunderG ==> lge_bd_rev = %d : 3rd LCD initial\n", lge_bd_rev);
-		display_table(mddi_hitachi_initialize_3rd_p500, sizeof(mddi_hitachi_initialize_3rd_p500)/sizeof(struct display_table));
-		display_table(mddi_hitachi_display_on_3rd, sizeof(mddi_hitachi_display_on_3rd) / sizeof(struct display_table));
-	}
-#elif defined(CONFIG_MACH_MSM7X27_THUNDERA)
-	display_table(mddi_hitachi_initialize_1st, 
-			sizeof(mddi_hitachi_initialize_1st)/sizeof(struct display_table));
-	display_table(mddi_hitachi_display_on_1st,
-			sizeof(mddi_hitachi_display_on_1st) / sizeof(struct display_table));
+#if defined(CONFIG_MACH_MSM7X27_THUNDERC) || defined(CONFIG_MACH_MSM7X27_GELATO)
+#if defined(CONFIG_FB_MSM_MDDI_24BIT)
+	hitachi_display_table(mddi_hitachi_initialize_24bit, sizeof(mddi_hitachi_initialize_24bit)/sizeof(struct display_table));
 #else
-	if (lge_bd_rev <= LGE_REV_D) {
-		EPRINTK("ThunderC ==> lge_bd_rev = %d : 1st LCD initial\n", lge_bd_rev);
-		display_table(mddi_hitachi_initialize_1st, sizeof(mddi_hitachi_initialize_1st)/sizeof(struct display_table));
-		display_table(mddi_hitachi_display_on_1st, sizeof(mddi_hitachi_display_on_1st) / sizeof(struct display_table));
-	} else {
-		EPRINTK("ThunderC ==> lge_bd_rev = %d : 3rd LCD initial\n", lge_bd_rev);
-		display_table(mddi_hitachi_initialize_3rd_vs660, sizeof(mddi_hitachi_initialize_3rd_vs660)/sizeof(struct display_table));
-		display_table(mddi_hitachi_display_on_3rd, sizeof(mddi_hitachi_display_on_3rd) / sizeof(struct display_table));
+	hitachi_display_table(mddi_hitachi_initialize_20110402, sizeof(mddi_hitachi_initialize_20110402)/sizeof(struct display_table));
+#endif
+	hitachi_display_table(mddi_hitachi_display_on, sizeof(mddi_hitachi_display_on) / sizeof(struct display_table));
+#endif
+
+#ifdef UPDATE_LUT_FROM_SDCARD
+	if ( (fd = sys_open((const char __user *) "/sdcard/lg_lut.txt", O_RDONLY, 0) ) < 0 )
+	{
+		printk("[LCD_LUT] Can not access SD card lg_lut.txt\n");
+	}
+	else
+	{
+		memset(lut_str_src, 0x00, 12);
+		memset(lut_str_dst, 0x00, 12);
+
+		/* MDP cmd block enable */
+		mdp_pipe_ctrl(MDP_CMD_BLOCK, MDP_BLOCK_POWER_ON, FALSE);
+
+		/* bit4 : LUT Table is Post(After matrix convert), bit2:0  : disable 3 components table. */
+		MDP_OUTP(MDP_BASE + 0x90070, 0x10);
+
+		for(i=0; i<256; i++) 
+		{
+			if((sys_read(fd, (char __user *) lut_str_src, 12)) < 0)
+			{
+				printk("[LCD_LUT] can't read SD card lg_lut.txt\n");
+			}
+			else
+			{
+				memcpy(lut_str_dst, lut_str_src, 10);
+				printk("[LCD_LUT] read lut_str_dst [%d] %s\n", i ,lut_str_dst);
+				lut_value = atoh(lut_str_dst, 10);
+				printk("[LCD_LUT] write register[%d] 0x%x\n", i ,lut_value);
+				outpdw(MDP_BASE + 0x93800 + i*4, lut_value); 
+				memset(lut_str_src, 0x00, 12);
+				memset(lut_str_dst, 0x00, 12);
+			}
+		}
+
+		/* bit4 : LUT Table is Post(After matrix convert), bit2:0  : enable 3 components table. */
+		MDP_OUTP(MDP_BASE + 0x90070, 0x17);
+		
+		/* MDP cmd block disable */
+		mdp_pipe_ctrl(MDP_CMD_BLOCK, MDP_BLOCK_POWER_OFF, FALSE);		
 	}
 #endif
+
 	is_lcd_on = TRUE;
 	return 0;
 }
@@ -583,48 +709,32 @@ static int mddi_hitachi_lcd_store_on(void)
 {
 	EPRINTK("%s: started.\n", __func__);
 
-#if defined(CONFIG_MACH_MSM7X27_THUNDERG) || defined(CONFIG_MACH_MSM7X27_THUNDERC) || defined(CONFIG_MACH_MSM7X27_THUNDERA)
+#if defined(CONFIG_MACH_MSM7X27_GELATO)
 	if (system_state == SYSTEM_BOOTING && mddi_hitachi_pdata->initialized) {
 		is_lcd_on = TRUE;
 		return 0;
 	}
 #endif
+
 	// LCD HW Reset
 	mddi_hitachi_lcd_panel_store_poweron();
-#if defined(CONFIG_MACH_MSM7X27_THUNDERG)
-	if (lge_bd_rev <= LGE_REV_E) {
-		display_table(mddi_hitachi_initialize_1st, sizeof(mddi_hitachi_initialize_1st)/sizeof(struct display_table));
-		mdelay(200);
-		display_table(mddi_hitachi_display_on_1st, sizeof(mddi_hitachi_display_on_1st) / sizeof(struct display_table));
-	} else {
-		display_table(mddi_hitachi_initialize_3rd_p500, sizeof(mddi_hitachi_initialize_3rd_p500)/sizeof(struct display_table));
-		mdelay(200);
-		display_table(mddi_hitachi_display_on_3rd, sizeof(mddi_hitachi_display_on_3rd) / sizeof(struct display_table));
-	}
-#elif defined(CONFIG_MACH_MSM7X27_THUNDERA)
-	display_table(mddi_hitachi_initialize_1st,
-			sizeof(mddi_hitachi_initialize_1st)/sizeof(struct display_table));
-	mdelay(200);
-	display_table(mddi_hitachi_display_on_1st,
-			sizeof(mddi_hitachi_display_on_1st) / sizeof(struct display_table));
+
+#if defined(CONFIG_MACH_MSM7X27_THUNDERC) || defined(CONFIG_MACH_MSM7X27_GELATO)
+#if defined(CONFIG_FB_MSM_MDDI_24BIT)
+	hitachi_display_table(mddi_hitachi_initialize_24bit, sizeof(mddi_hitachi_initialize_24bit)/sizeof(struct display_table));
 #else
-	if (lge_bd_rev <= LGE_REV_D) {
-		display_table(mddi_hitachi_initialize_1st, sizeof(mddi_hitachi_initialize_1st)/sizeof(struct display_table));
-		mdelay(200);
-		display_table(mddi_hitachi_display_on_1st, sizeof(mddi_hitachi_display_on_1st) / sizeof(struct display_table));
-	} else {
-		display_table(mddi_hitachi_initialize_3rd_vs660, sizeof(mddi_hitachi_initialize_3rd_vs660)/sizeof(struct display_table));
-		mdelay(200);
-		display_table(mddi_hitachi_display_on_3rd, sizeof(mddi_hitachi_display_on_3rd) / sizeof(struct display_table));
-	}
+	hitachi_display_table(mddi_hitachi_initialize_20110402, sizeof(mddi_hitachi_initialize_20110402)/sizeof(struct display_table));
 #endif
+	hitachi_display_table(mddi_hitachi_display_on, sizeof(mddi_hitachi_display_on) / sizeof(struct display_table));
+#endif
+
 	is_lcd_on = TRUE;
 	return 0;
 }
 
 static int mddi_hitachi_lcd_off(struct platform_device *pdev)
 {
-	display_table(mddi_hitachi_sleep_mode_on_data, sizeof(mddi_hitachi_sleep_mode_on_data)/sizeof(struct display_table));
+	hitachi_display_table(mddi_hitachi_sleep_mode_on_data, sizeof(mddi_hitachi_sleep_mode_on_data)/sizeof(struct display_table));
 	mddi_hitachi_lcd_panel_poweroff();
 	is_lcd_on = FALSE;
 	return 0;
@@ -645,12 +755,10 @@ ssize_t mddi_hitachi_lcd_store_onoff(struct device *dev, struct device_attribute
 	EPRINTK("%s: onoff : %d\n", __func__, onoff);
 	
 	if(onoff) {
-//		display_table(mddi_hitachi_display_on, sizeof(mddi_hitachi_display_on) / sizeof(struct display_table));
 		mddi_hitachi_lcd_store_on();
 		is_lcd_on = TRUE;
 	}
 	else {
-//		display_table(mddi_hitachi_display_off, sizeof(mddi_hitachi_display_off) / sizeof(struct display_table));
 		mddi_hitachi_lcd_off(&dummy_pdev);
 		is_lcd_on = FALSE;
 	}
@@ -660,12 +768,17 @@ ssize_t mddi_hitachi_lcd_store_onoff(struct device *dev, struct device_attribute
 
 int mddi_hitachi_position(void)
 {
-	display_table(mddi_hitachi_position_table, ARRAY_SIZE(mddi_hitachi_position_table));
+	hitachi_display_table(mddi_hitachi_position_table, ARRAY_SIZE(mddi_hitachi_position_table));
 	return 0;
 }
 EXPORT_SYMBOL(mddi_hitachi_position);
 
-DEVICE_ATTR(lcd_onoff, 0666, mddi_hitachi_lcd_show_onoff, mddi_hitachi_lcd_store_onoff);
+/* LGE_CHANGE [james.jang@lge.com] 2010-08-28, probe LCD */
+#if defined(CONFIG_FB_MSM_MDDI_NOVATEK_HITACHI_HVGA)
+DEVICE_ATTR(hitachi_lcd_onoff, 0666, mddi_hitachi_lcd_show_onoff, mddi_hitachi_lcd_store_onoff);
+#else
+DEVICE_ATTR(lcd_onoff, 0665, mddi_hitachi_lcd_show_onoff, mddi_hitachi_lcd_store_onoff);
+#endif
 
 struct msm_fb_panel_data hitachi_panel_data0 = {
 	.on = mddi_hitachi_lcd_on,
@@ -682,7 +795,7 @@ static struct platform_device this_device_0 = {
 	}
 };
 
-static int __init mddi_hitachi_lcd_probe(struct platform_device *pdev)
+static int mddi_hitachi_lcd_probe(struct platform_device *pdev)
 {
 	int ret;
 	EPRINTK("%s: started.\n", __func__);
@@ -694,12 +807,17 @@ static int __init mddi_hitachi_lcd_probe(struct platform_device *pdev)
 
 	msm_fb_add_device(pdev);
 
+/* LGE_CHANGE [james.jang@lge.com] 2010-08-28, probe LCD */
+#if defined(CONFIG_FB_MSM_MDDI_NOVATEK_HITACHI_HVGA)
+	ret = device_create_file(&pdev->dev, &dev_attr_hitachi_lcd_onoff);
+#else
 	ret = device_create_file(&pdev->dev, &dev_attr_lcd_onoff);
+#endif
 
 	return 0;
 }
 
-static struct platform_driver this_driver __refdata = {
+static struct platform_driver this_driver = {
 	.probe  = mddi_hitachi_lcd_probe,
 	.driver = {
 		.name   = "mddi_hitachi_hvga",
@@ -718,6 +836,26 @@ static int mddi_hitachi_lcd_init(void)
 	/* TODO: Check client id */
 
 #endif
+
+/* LGE_CHANGE [james.jang@lge.com] 2010-08-28, probe LCD */
+#if defined(CONFIG_LGE_PCB_REV_A)
+#if defined(CONFIG_FB_MSM_MDDI_NOVATEK_HITACHI_HVGA)
+	gpio_tlmm_config(GPIO_CFG(101, 0, GPIO_INPUT, GPIO_PULL_DOWN, GPIO_2MA), GPIO_ENABLE);
+	gpio_configure(101, GPIOF_INPUT);
+	if (gpio_get_value(101) != 0)
+		return -ENODEV;
+	g_mddi_lcd_probe = 0;
+#endif
+#else
+#if defined(CONFIG_FB_MSM_MDDI_NOVATEK_HITACHI_HVGA)
+	gpio_tlmm_config(GPIO_CFG(93, 0, GPIO_INPUT, GPIO_PULL_DOWN, GPIO_2MA), GPIO_ENABLE);
+	gpio_configure(93, GPIOF_INPUT);
+	if (gpio_get_value(93) != 0)
+		return -ENODEV;
+	g_mddi_lcd_probe = 0;
+#endif
+#endif
+
 	ret = platform_driver_register(&this_driver);
 	if (!ret) {
 		pinfo = &hitachi_panel_data0.panel_info;
@@ -728,8 +866,11 @@ static int mddi_hitachi_lcd_init(void)
 		pinfo->pdest = DISPLAY_1;
 		pinfo->mddi.vdopkt = 0x23;//MDDI_DEFAULT_PRIM_PIX_ATTR;
 		pinfo->wait_cycle = 0;
+#if defined(CONFIG_FB_MSM_MDDI_24BIT)
+		pinfo->bpp = 24;
+#else
 		pinfo->bpp = 16;
-	
+#endif
 		// vsync config
 		pinfo->lcd.vsync_enable = TRUE;
 		pinfo->lcd.refx100 = (mddi_hitachi_rows_per_second * 100) /
@@ -751,8 +892,8 @@ static int mddi_hitachi_lcd_init(void)
 		pinfo->bl_min = 1;
 
 		pinfo->clk_rate = 10000000;
-		pinfo->clk_min =  9000000;
-		pinfo->clk_max =  11000000;
+		pinfo->clk_min = 9000000;
+		pinfo->clk_max = 11000000;
 		pinfo->fb_num = 2;
 
 		ret = platform_device_register(&this_device_0);
@@ -774,7 +915,7 @@ extern unsigned fb_height;
 
 static void mddi_hitachi_lcd_panel_poweron(void)
 {
-#if defined(CONFIG_MACH_MSM7X27_THUNDERG) || defined(CONFIG_MACH_MSM7X27_THUNDERC) || defined(CONFIG_MACH_MSM7X27_THUNDERA)
+#if defined(CONFIG_MACH_MSM7X27_GELATO)
 	struct msm_panel_hitachi_pdata *pdata = mddi_hitachi_pdata;
 #else
 	struct msm_panel_common_pdata *pdata = mddi_hitachi_pdata;
@@ -786,8 +927,8 @@ static void mddi_hitachi_lcd_panel_poweron(void)
 	fb_height = 480;
 
 	if(pdata && pdata->gpio) {
-	//	gpio_set_value(pdata->gpio, 1);
-	//	mdelay(10);
+		gpio_set_value(pdata->gpio, 1);
+		mdelay(10);
 		gpio_set_value(pdata->gpio, 0);
 		mdelay(10);
 		gpio_set_value(pdata->gpio, 1);
@@ -797,7 +938,7 @@ static void mddi_hitachi_lcd_panel_poweron(void)
 
 static void mddi_hitachi_lcd_panel_store_poweron(void)
 {
-#if defined(CONFIG_MACH_MSM7X27_THUNDERG) || defined(CONFIG_MACH_MSM7X27_THUNDERC) || defined(CONFIG_MACH_MSM7X27_THUNDERA)
+#if defined(CONFIG_MACH_MSM7X27_GELATO)
 	struct msm_panel_hitachi_pdata *pdata = mddi_hitachi_pdata;
 #else
 	struct msm_panel_common_pdata *pdata = mddi_hitachi_pdata;
@@ -809,8 +950,8 @@ static void mddi_hitachi_lcd_panel_store_poweron(void)
 	fb_height = 480;
 
 	if(pdata && pdata->gpio) {
-	//	gpio_set_value(pdata->gpio, 1);
-	//	mdelay(10);
+		gpio_set_value(pdata->gpio, 1);
+		mdelay(10);
 		gpio_set_value(pdata->gpio, 0);
 		mdelay(50);
 		gpio_set_value(pdata->gpio, 1);
